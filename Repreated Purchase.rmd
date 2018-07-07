@@ -1,0 +1,1259 @@
+---
+title: "Repeated Purchase Prediction"
+author: "Yan_Li"
+date: "June 12, 2018"
+output: 
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+    
+---
+```{r setup, include=FALSE,echo=FALSE}
+knitr::opts_chunk$set(echo=TRUE,error=FALSE)
+```
+
+# Introduction
+
+XYZ company sells products offline with a membership system which records all users basic demographics features,transaction data and shipment information(data period from Jan,2016 to Dec,2016). In this case, we want to predict which customers will purchase again in 2016.6-2016.8 and what are the important factors to repeated purchase.
+
+# Preparation {.tabset .tabset-fade .tabset-pills}
+## Load libraries
+Load libraries including data manipulation, data visulation and machine learning.
+```{r message=FALSE,warning=FALSE}
+
+library(readxl)#read data
+library(dplyr)#data manipulation
+library(data.table)#data manipulation
+library(DT)#data manipulation
+library(sqldf)#data manipulation
+library(reshape2)#data manipulation
+library(knitr)#data manipulation
+library(tidyr)#data manipulation
+library(mice) #package to deal with missing value
+library(VIM) #package to deal with missing value
+library(lattice) #package to deal with missing value
+
+library(ggplot2) #data visualization
+library(corrplot) #data visualization 
+
+library(mlr) #machine learning
+library(caret) #machine learning
+library(FSelector) #machine learning
+library("parallelMap") #Parallelized Computation
+
+#Parallel computation
+parallelStartSocket(4)
+#parallelStop()
+```
+
+## Customized Function
+
+We can use multiplot function to create multiple plots on one page.
+```{r}
+#Source:Cookbook for R http://www.cookbook-r.com/Graphs/Multiple_graphs_on_one_page_(ggplot2)/
+
+#Define multiplot function 
+# ggplot objects can be passed in ..., or to plotlist (as a list of ggplot objects)
+# - cols:   Number of columns in layout
+# - layout: A matrix specifying the layout. If present, 'cols' is ignored.
+#
+# If the layout is something like matrix(c(1,2,3,3), nrow=2, byrow=TRUE),
+# then plot 1 will go in the upper left, 2 will go in the upper right, and
+# 3 will go all the way across the bottom.
+#
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+
+
+```
+
+function to extract binomial confidence levels
+```{r}
+get_CI <- function(x,n) as.list(setNames(binom.test(x,n)$conf.int, c("lwr", "upr")))
+```
+
+
+
+
+## Load data
+
+```{r warning=FALSE,message=FALSE,results=FALSE}
+df_raw<-read_excel("test.xlsx",sheet=1,na=c("","NULL"))
+```
+
+
+
+# Data structure,content and manipulation {.tabset .tabset-fade .tabset-pills}
+
+## Original Structure and Variables
+```{r}
+kable(head(df_raw,12))
+glimpse(df_raw)
+```
+
+
+## Data manipulation
+```{r}
+#Change column names to read easily
+colnames(df_raw)<-c("memberID","productID","age","SKU1","SKU2","SKU3","Date_shipment","gender","city","country","phone","message","email","contact_method","total_amount","Date_latest_purchase","installment","Date_trans","sales_amount","install_flag","sales_method","shipment_method","VIP")
+
+#Convert date
+df_raw[,cols<-grep("Date",names(df_raw))]<-lapply(df_raw[,cols<-grep("Date",names(df_raw))],as.Date,format="%Y-%m-%d")
+
+#Character to factor
+colnames(df_raw)
+df_raw[,c(4,5,8:14,17,20:23)]<-lapply(df_raw[,c(4,5,8:14,17,20:23)],as.factor)
+
+#Character to numeric variable
+df_raw$age<-as.numeric(df_raw$age)
+
+```
+
+
+## Data deletion and recalculation
+
+Because our goal is to predict whether customer will repeat purchase in 2016.6-2016.8 or not, all the known data points should before 2016.6. We have to remove all the data points after 2016.6 and regard 2016.6-2016.8 purchase action as prediction flag. 
+
+```{r}
+#create new dataset as known data
+df<-df_raw%>%
+  filter(Date_trans<"2016-06-01")
+#create new dataset as to identify flag:transcation between 2016.6 and 2016.8
+df_flag<-df_raw%>%
+  filter(Date_trans>="2016-06-01"&Date_trans<="2016-08-31")
+```
+
+
+Add prediction flag to known data
+```{r}
+#If memebers have more than 1 purchase between 2016.1-2016.5 and purchase in 2016.6-2016.8, flag them as 1,if not, flag them as 0.
+
+#Find memebers who purchased between 2016.6-2016.8
+purchase_after<-df_flag%>%
+  group_by(memberID)%>%
+  summarize(purchase_count=n())
+#Add flag to identify members who purchased again between 2016.6-2016.8
+df<-sqldf("SELECT before.*,
+               CASE WHEN after.purchase_count IS NOT NULL THEN 1
+               ELSE 0 END AS flag
+               FROM df AS before
+               LEFT JOIN purchase_after AS after
+               ON before.memberID=after.memberID")
+df_customer<-df%>%
+  group_by(memberID)%>%
+  summarize(flag=mean(flag))
+flag_stat<-data.frame(table(df_customer$flag))%>%
+  mutate(ratio=Freq/sum(Freq))
+```
+
+Recaculate the total amount and latest purchase date on 2016.05.31
+```{r}
+df_total<-df_raw%>%
+  filter(Date_trans>="2016-06-01")%>%
+  group_by(memberID)%>%
+  summarize(total_amount=mean(total_amount),amount_after=sum(sales_amount))%>%
+  mutate(total_amount_before=total_amount-amount_after)
+df_recaculate<-df%>%
+  group_by(memberID)%>%
+  summarize(total_amount_before_1=mean(total_amount),Date_latest_purchase_531=max(Date_trans),total_sales=sum(sales_amount))%>%
+  left_join(df_total,by="memberID")%>%
+  mutate(total_amount_531=ifelse(is.na(total_amount_before)&!is.na(total_amount_before_1),total_amount_before_1,ifelse(is.na(total_amount_before_1),total_sales,total_amount_before_1)))%>%
+  select(memberID,total_amount_531,Date_latest_purchase_531)
+
+#Replace the original columns
+df<-df%>%
+  left_join(y=df_recaculate,by="memberID")%>%
+  select(-total_amount,-Date_latest_purchase)
+```
+
+
+
+## Missing value
+```{r}
+summary(df)
+```
+From the summary we could see there're several variables with missing value. We have to decide which type of missing value it is and come out with corresponding imputation.
+
+Three types of missing values:
+1.MCAR: Missing is completely random as a random sample.We can simply delete the sample.
+2.MAR:Missing values are random based on the all the other data we have instead of missing value itself. We can imputate missing values with models using the observed data.
+3.MNAR: The reason for missingness depends on the missing value itself. It's hard to handle.
+
+In practice, we have to consider the threshold of missing value proportion for each variable. 
+1.If the proportion of missingness for one variable is higher than 5%, we may decide which type of missingness it is? How important it is to the variables we're interested to? How to handle it? (Imputation or deletion)
+2.If one observation have more than two missing variables which are very important, we may consider remove the observation.
+
+Inspect missing data
+```{r warning=FALSE}
+md.pattern(df)
+```
+
+
+```{r warning=FALSE}
+aggr_df = aggr(df, col=mdc(1:2), numbers=TRUE, sortVars=TRUE, labels=names(df), cex.axis=.7, gap=1, ylab=c("Proportion of missingness","Missingness Pattern"))
+```
+
+From the plot on the left we could see, for variables as "phone","message","contact method", their proportions of missingness are 1.0. They're missings not at random with no method to imputate,so we have to delete these variables.
+```{r}
+df[,c("phone","message","contact_method")]<-NULL
+```
+
+For installment,install_flag,sales_method,shipment_method,and VIP, these variables all have same proportion of missing value. Let's check if all the missing values happened within the same observations.
+```{r}
+md.pattern(df[,c("installment","install_flag","sales_method","shipment_method","VIP")])
+```
+We find that all the missing values happened within the same observations which might because some sales departments didn't input related information continually. It's MNAR but considering there're 30% observations so we regard them as "unknown" type.
+```{r}
+df$Date_shipment<-as.character(df$Date_shipment)
+df[,c("installment","install_flag","sales_method","shipment_method","VIP")]<-lapply(df[,c("installment","install_flag","sales_method","shipment_method","VIP")],as.character)
+df[c("Date_shipment","installment","install_flag","sales_method","shipment_method","VIP")][is.na(df[c("Date_shipment","installment","install_flag","sales_method","shipment_method","VIP")])]<-"unknown"
+```
+
+
+Demographic variables:one assumption for demographic variables is for the same memberID, it should have the same age,gender,city,country,total_amount and Date_latest_purchase. We can testify it and imputate missing values.
+```{r}
+df_test<-df%>%
+  group_by(memberID)%>%
+  summarize(n_age=n_distinct(age),n_gender=n_distinct(gender),n_city=n_distinct(city),n_country=n_distinct(country))
+df_test[df_test$n_gender!=1|df_test$n_city!=1|df_test$n_country!=1,]
+```
+After testify, besides several members' age have increased by 1 year, every other variables only has one distinct value which follows our hypothesis.
+
+Set age,gender NA as unknown. 
+```{r}
+df[,c("age","gender")]<-lapply(df[,c("age","gender")],as.character)
+df[c("age","gender")][is.na(df[c("age","gender")])]<-"unknown"
+```
+
+City and Country distribution
+```{r}
+ggplot(df,aes(city,fill=city))+geom_bar()
+ggplot(df,aes(country,fill=country))+geom_bar()
+```
+
+Based on mode,fill all NA city with "Beijing" and because all the countries is "CN". There's no need to include this variable in our prediction because of limited variation.
+```{r}
+#Fill NA city
+df$city[is.na(df$city)]<-"北京市"
+
+#Delete country variable
+df$country<-NULL
+```
+Email distribution
+```{r}
+ggplot(df,aes(email,fill=email))+geom_bar()
+#Fill NA with "0"
+df$email[is.na(df$email)]<-0
+```
+
+
+
+
+
+## Reformating variables
+```{r warning=FALSE}
+df$Date_shipment<-as.Date(df$Date_shipment,format="%Y-%m-%d")
+
+#Character to factor
+df[,c("SKU3","installment","install_flag","sales_method","shipment_method","VIP","gender","city","email","flag")]<-lapply(df[,c("SKU3","installment","install_flag","sales_method","shipment_method","VIP","gender","city","email","flag")],as.factor)
+
+df$age<-as.numeric(df$age)
+
+```
+
+
+## Sanity Check
+
+Let's check the ourlier and replace it with mean value
+
+```{r}
+boxplot(df$age,horizontal = TRUE,axes=TRUE)
+age_mean<-round(mean(df$age[df$age>0],na.rm = TRUE),0)
+df$age[df$age<0]<-age_mean
+```
+
+
+We find there're 54% of members with no age information.
+```{r}
+df%>%
+  group_by(memberID)%>%
+  summarize(age=mean(age))%>%
+  summarize(na.prop=sum(is.na(age))/n())
+```
+
+Let's see what's the relationship between age(without NA) and repeat purchase.From the density plot we could see the purchase rate is different between 30-50. 
+```{r}
+df%>%
+  group_by(memberID,flag)%>%
+  summarize(age=mean(age))%>%
+  ggplot(aes(age))+
+  geom_density(alpha=0.5,aes(fill=as.factor(flag)))+
+  labs(title="Repeat Purchase Density Per Age")+
+  scale_x_continuous(breaks=seq(-50,100,by=10))
+
+
+```
+
+Let's check the distribution of repeat purchase rate among members without age information.
+```{r}
+
+p1<-df%>%
+  select(age,flag,memberID)%>%
+  filter(!is.na(age))%>%
+  group_by(memberID,flag)%>%
+  ggplot(aes(factor(flag),fill=factor(flag)))+
+  geom_bar(aes(y=(..count..)/sum(..count..)))+
+  scale_y_continuous(breaks=seq(0,1,by=0.1))+
+  labs(x="flag",y="percent",title="Repeat Purchase Distribution for Age without NA")
+
+p2<-df%>%
+  select(age,flag,memberID)%>%
+  filter(!is.na(age))%>%
+  group_by(memberID,flag)%>%
+  ggplot(aes(factor(flag),fill=factor(flag)))+
+  geom_bar(aes(y=(..count..)/sum(..count..)))+
+  scale_y_continuous(breaks=seq(0,1,by=0.1))+
+  labs(x="flag",y="percent",title="Repeat Purchase Distribution for NA Age")
+
+layout <- matrix(c(1,2),1,2,byrow=TRUE)
+multiplot(p1, p2, layout=layout) 
+```
+The group without age information have lower repeat purchase rate compared with group with age information.So we decide create age groups including unknown group and have to also pay attention to the bin width.  
+
+```{r}
+#Create age group as (<30,30-50,50-70,>70,unknown)
+df<-df%>%
+  mutate(age_group=as.factor(case_when(age<30~"<30",
+                             age>=30&age<=50~"30-50",
+                             age>50&age<=70~"50-70",
+                             age>70~">70",
+                             is.na(age)~"unknown")))%>%
+  select(-age)
+df$age_group<-ordered(df$age_group,levels=c("unknown","30-50","50-70",">70"))
+
+```
+
+
+There're some outliers in Date_shipment
+```{r}
+boxplot(df$Date_shipment,horizontal = TRUE,axes=TRUE)
+
+#Remove outliers
+df$Date_shipment[df$Date_shipment>as.Date("2017-06-01","%Y-%m-%d")]<-NA
+boxplot(df$Date_shipment,horizontal = TRUE,axes=TRUE)
+```
+
+It looks like *install_flag* and *installment* are the same. Let's check the variance of these two features.After check, we find there are identical. We have to delete one.
+```{r}
+nrow(df[df$installment==df$install_flag,])
+df$install_flag<-NULL
+```
+
+
+
+
+## Final summary
+```{r}
+summary(df)
+```
+
+
+# Feature Engineering {.tabset}
+Becasue features are very important to predictive models and with oringinal dataset we only have features including product profile, demographic profile and shipment profile, it's essential to create more target-related features and explore their significants to classify target variable. Our feature engineering process includes:     
+1. Feature classification
+2. Feature initial exploratory
+2. Feature construction    
+3. Feature initial selection(included in next part)   
+
+
+## Feature classification 
+
+All the original features could be divided into product profile, demographic profile and shipment profile. We'll assign them into three groups and create new features based on them. We can also classify features based on class: character,categorical feature, numeric features(integer and float),date.
+```{r}
+colnames(df)
+# classification based on feature nature
+product_cl<-c("productID","SKU1","SKU2","SKU3","Date_trans","sales_amount","sales_method")
+user_cl<-c("memberID","age_group","gender","city","email","total_amount_531","Date_latest_purchase_531")
+shipment_cl<-c("Date_shipment","installment","install_flag","shipment_method","VIP")
+
+#classification based on feature class
+cha_cl<-c("memberID","productID")
+cat_cl<-c("SKU1","SKU2","SKU3","gender","city","email","installment","install_flag","sales_method","shipment_method","VIP","flag","age_group")
+date_cl<-c("Date_shipment","Date_trans","Date_latest_purchase_531")
+float_cl<-c("sales_amount","total_amount_531")
+```
+
+## Feature initial exploratory {.tabset}
+Next, we'll plot the distribution of each variable and the relationship between independ variable and target to decide which variable need further construction.
+
+### Split training and testing dataset {-}
+
+To avoid overfitting, our exploratory part should only include training dataset.
+```{r}
+#Add date features
+df<-df%>%  
+mutate(week=week(Date_trans),weekday=weekdays(Date_trans),month=month(Date_trans))
+
+#Split stratified traing and testing data 
+df_customer_list<-df%>%
+  group_by(memberID,flag)%>%
+  summarize(cou=n())
+
+set.seed(1234)
+train.index<-createDataPartition(df_customer$flag, p = .7, list = FALSE)
+df_train_customer<-df_customer_list[train.index,][,-(2:3)]
+df_test_customer<-df_customer_list[-train.index,][,-(2:3)]
+
+#Split original dataset
+df_train<-inner_join(df,df_train_customer,by="memberID")
+df_test<-inner_join(df,df_test_customer,by="memberID")
+```
+
+### Individual features {.tabset}
+
+From these individual features' count visualizations, we could see how features distribute and we have to notice that some levels of features have limited count. We may combine it with multi-feature analysis and consider to remove it or integrate it to higher level.
+
+#### Individual Categorical features part 1 {-}
+```{r split=FALSE, fig.align = 'default', warning = FALSE, fig.cap ="Fig. 1", out.width="100%"}
+
+p1 <- df_train %>%
+  ggplot(aes(SKU1, fill = SKU1)) +
+  geom_bar() +
+  theme(legend.position = "none")
+p2 <- df_train %>%
+  ggplot(aes(SKU2, fill = SKU2)) +
+  geom_bar() +
+  theme(legend.position = "none",axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))
+p3 <- df_train %>%
+  ggplot(aes(SKU3, fill = SKU3)) +
+  geom_bar() +
+  theme(legend.position = "none",axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))
+p4 <- df_train %>%
+  ggplot(aes(installment, fill = installment)) +
+  geom_bar() +
+  theme(legend.position = "none")
+
+p6 <- df_train %>%
+  ggplot(aes(sales_method, fill = sales_method)) +
+  geom_bar() +
+  theme(legend.position = "none")
+layout <- matrix(c(1,2,3,4,5,5),3,2,byrow=TRUE)
+multiplot(p1, p2, p6, p4, p3, layout=layout)
+```
+
+#### Individual Categorical features part 2 {-}
+```{r split=FALSE, fig.align = 'default', warning = FALSE, fig.cap ="Fig. 2", out.width="100%"}
+df_train[df_train$memberID=="133867735","age_group"]<-"30-50"
+
+df_train_group<-df_train%>%
+  group_by(memberID,gender,city,email,flag,age_group)%>%
+  summarize(count=n(),total_amount_531=mean(total_amount_531),total_amount_2016=sum(sales_amount))
+df_train_group<-data.frame(df_train_group)
+
+p1 <- df_train %>%
+  ggplot(aes(shipment_method, fill = shipment_method)) +
+  geom_bar() +
+  theme(legend.position = "none")
+p2 <- df_train %>%
+  ggplot(aes(VIP, fill = VIP)) +
+  geom_bar() +
+  theme(legend.position = "none")
+p3 <- df_train_group %>%
+  ggplot(aes(gender, fill = gender)) +
+  geom_bar() +
+  theme(legend.position = "none")
+p4 <- df_train_group %>%
+  ggplot(aes(city, fill = city)) +
+  geom_bar() +
+  theme(legend.position = "none",axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))
+p5 <- df_train_group %>%
+  ggplot(aes(email, fill = email)) +
+  geom_bar() +
+  theme(legend.position = "none")
+p6 <- df_train_group %>%
+  ggplot(aes(age_group, fill = age_group)) +
+  geom_bar() +
+  theme(legend.position = "none")
+layout <- matrix(c(1,2,3,4,5,6),3,2,byrow=TRUE)
+multiplot(p1, p2, p3, p4, p5, p6, layout=layout)
+```
+
+#### Individual Numeric features {-}
+```{r split=FALSE, fig.align = 'default', warning = FALSE, fig.cap ="Fig. 3", out.width="100%"}
+p1 <- df_train %>%
+  ggplot(aes(sales_amount, fill = sales_amount)) +
+  geom_density(fill = "blue") +
+  theme(legend.position = "none")+
+  scale_x_continuous(breaks=seq(0,3000,200))
+p2 <- df_train_group %>%
+  ggplot(aes(total_amount_531, fill = total_amount_531)) +
+  geom_density(fill = "blue") +
+  theme(legend.position = "none")+
+  scale_x_continuous(limits=c(1,4000),breaks=seq(0,4000,400))
+p3 <- df_train_group %>%
+  ggplot(aes(total_amount_2016, fill = total_amount_2016)) +
+  geom_density(fill = "blue") +
+  theme(legend.position = "none")+
+  scale_x_continuous(limits=c(1,4000),breaks=seq(0,5000,500))
+
+layout <- matrix(c(1,2),2,1,byrow=TRUE)
+multiplot(p1, p2, layout=layout)
+```
+
+#### Individual Date features {-}
+```{r split=FALSE, fig.align = 'default', warning = FALSE, fig.cap ="Fig. 4", out.width="100%"}
+##sales pattern
+p1<-df_train%>%
+  group_by(week)%>%
+  summarize(total_amount=sum(sales_amount))%>%
+  ggplot()+geom_bar(aes(week,total_amount,fill=as.factor(week)),stat="identity")+theme(legend.position = "none")
+p2<-df_train%>%
+  group_by(weekday)%>%
+  summarize(total_amount=sum(sales_amount))%>%
+  ggplot()+geom_bar(aes(weekday,total_amount,fill=as.factor(weekday)),stat="identity")+theme(legend.position = "none",axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))
+p3<-df_train%>%
+  group_by(month)%>%
+  summarize(total_amount=sum(sales_amount))%>%
+  ggplot()+geom_bar(aes(month,total_amount,fill=as.factor(month)),stat="identity")+theme(legend.position = "none")
+p4<-df_train%>%
+  group_by(Date_trans)%>%
+  summarize(total_amount=sum(sales_amount))%>%
+  ggplot()+geom_line(aes(Date_trans,total_amount))+theme(legend.position = "none")
+layout <- matrix(c(1,2,3,4,4,4),2,3,byrow=TRUE)
+multiplot(p1, p2,p3,p4, layout=layout)
+```
+
+
+### Repeat Purchase Rate for individual features {.tabset}
+
+Next we have to explore the relationship among repeat purchase and individual features to decide which feature is important when classifing target. We also add error margin with 95% confidence level based on statistical significance calculation on "repeat purchase".
+
+Conclusion: The features which we find have significant different repeated purchase rate are:    
+1. *SKU1*    
+2. *sales_method*    
+3. *shipment_method*(1 and the other)    
+4. *VIP*   
+5. *total_amount_531*   
+6. *total_amount_2016*   
+
+#### Interaction-Categorical features with target part 1 {-}
+
+```{r split=FALSE, fig.align = 'default', warning = FALSE, fig.cap ="Fig. 1", out.width="100%"}
+p1 <- df_train %>%
+  group_by(SKU1, flag) %>%
+  count() %>%
+  spread(flag, n) %>%
+  mutate(frac_claim = `1`/(`1`+`0`)*100,
+         lwr = get_CI(`1`,(`1`+`0`))[[1]]*100,
+         upr = get_CI(`1`,(`1`+`0`))[[2]]*100
+         ) %>%
+  ggplot(aes(reorder(SKU1, -frac_claim, FUN = max), frac_claim, fill = SKU1)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5, size = 0.7, color = "gray30") +
+  theme(legend.position = "none") +
+  labs(x = "SKU1", y = "repeated purchase [%]")
+
+p2 <- df_train %>%
+  group_by(SKU2, flag) %>%
+  count() %>%
+  spread(flag, n,fill=0) %>%
+  mutate(frac_claim = `1`/(`1`+`0`)*100,
+         lwr = get_CI(`1`,(`1`+`0`))[[1]]*100,
+         upr = get_CI(`1`,(`1`+`0`))[[2]]*100
+         ) %>%
+  ggplot(aes(reorder(SKU2, -frac_claim, FUN = max), frac_claim, fill = SKU2)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5, size = 0.7, color = "gray30") +
+  theme(legend.position = "none",axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) +
+  labs(x = "SKU2", y = "repeated purchase [%]")
+
+p3 <- df_train %>%
+  group_by(SKU3, flag) %>%
+  count() %>%
+  spread(flag, n,fill=0) %>%
+  mutate(frac_claim = `1`/(`1`+`0`)*100,
+         lwr = get_CI(`1`,(`1`+`0`))[[1]]*100,
+         upr = get_CI(`1`,(`1`+`0`))[[2]]*100
+         ) %>%
+  ggplot(aes(reorder(SKU3, -frac_claim, FUN = max), frac_claim, fill = SKU3)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5, size = 0.7, color = "gray30") +
+  theme(legend.position = "none",axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) +
+  labs(x = "SKU3", y = "repeated purchase [%]")
+
+p4 <- df_train %>%
+  group_by(installment, flag) %>%
+  count() %>%
+  spread(flag, n,fill=0) %>%
+  mutate(frac_claim = `1`/(`1`+`0`)*100,
+         lwr = get_CI(`1`,(`1`+`0`))[[1]]*100,
+         upr = get_CI(`1`,(`1`+`0`))[[2]]*100
+         ) %>%
+  ggplot(aes(reorder(installment, -frac_claim, FUN = max), frac_claim, fill = installment)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5, size = 0.7, color = "gray30") +
+  theme(legend.position = "none") +
+  labs(x = "installment", y = "repeated purchase [%]")
+
+
+p6 <- df_train %>%
+  group_by(sales_method, flag) %>%
+  count() %>%
+  spread(flag, n,fill=0) %>%
+  mutate(frac_claim = `1`/(`1`+`0`)*100,
+         lwr = get_CI(`1`,(`1`+`0`))[[1]]*100,
+         upr = get_CI(`1`,(`1`+`0`))[[2]]*100
+         ) %>%
+  ggplot(aes(reorder(sales_method, -frac_claim, FUN = max), frac_claim, fill = sales_method)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5, size = 0.7, color = "gray30") +
+  theme(legend.position = "none") +
+  labs(x = "sales_method", y = "repeated purchase [%]")
+
+layout <- matrix(c(1,2,3,4,5,5),3,2,byrow=TRUE)
+multiplot(p1, p2, p6, p4, p3, layout=layout)
+```
+
+#### Interaction-Categorical features with target part 2 {-}
+
+```{r split=FALSE, fig.align = 'default', warning = FALSE, fig.cap ="Fig. 2", out.width="100%"}
+p1 <- df_train %>%
+  group_by(shipment_method, flag) %>% 
+  count() %>%
+  spread(flag, n,fill=0) %>%
+  mutate(frac_claim = `1`/(`1`+`0`)*100,
+         lwr = get_CI(`1`,(`1`+`0`))[[1]]*100,
+         upr = get_CI(`1`,(`1`+`0`))[[2]]*100
+         ) %>%
+  ggplot(aes(reorder(shipment_method, -frac_claim, FUN = max), frac_claim, fill = shipment_method)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5, size = 0.7, color = "gray30") +
+  theme(legend.position = "none") +
+  labs(x = "shipment_method", y = "repeated purchase [%]")
+
+p2 <- df_train %>%
+  group_by(VIP, flag) %>%
+  count() %>%
+  spread(flag, n,fill=0) %>%
+  mutate(frac_claim = `1`/(`1`+`0`)*100,
+         lwr = get_CI(`1`,(`1`+`0`))[[1]]*100,
+         upr = get_CI(`1`,(`1`+`0`))[[2]]*100
+         ) %>%
+  ggplot(aes(reorder(VIP, -frac_claim, FUN = max), frac_claim, fill = VIP)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5, size = 0.7, color = "gray30") +
+  theme(legend.position = "none") +
+  labs(x = "VIP", y = "repeated purchase [%]")
+
+p3 <- df_train_group %>%
+  group_by(gender, flag) %>%
+  count() %>%
+  spread(flag, n,fill=0) %>%
+  mutate(frac_claim = `1`/(`1`+`0`)*100,
+         lwr = get_CI(`1`,(`1`+`0`))[[1]]*100,
+         upr = get_CI(`1`,(`1`+`0`))[[2]]*100
+         ) %>%
+  ggplot(aes(reorder(gender, -frac_claim, FUN = max), frac_claim, fill = gender)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5, size = 0.7, color = "gray30") +
+  theme(legend.position = "none") +
+  labs(x = "gender", y = "repeated purchase [%]")
+
+p4 <- df_train_group %>%
+  group_by(city, flag) %>%
+  count() %>%
+  spread(flag, n,fill=0) %>%
+  mutate(frac_claim = `1`/(`1`+`0`)*100,
+         lwr = get_CI(`1`,(`1`+`0`))[[1]]*100,
+         upr = get_CI(`1`,(`1`+`0`))[[2]]*100
+         ) %>%
+  ggplot(aes(reorder(city, -frac_claim, FUN = max), frac_claim, fill = city)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5, size = 0.7, color = "gray30") +
+  theme(legend.position = "none",axis.text.x=element_text(angle=90,hjust=1,vjust=0.5)) +
+  labs(x = "city", y = "repeated purchase [%]")
+
+p5 <- df_train_group %>%
+  group_by(email, flag) %>%
+  count() %>%
+  spread(flag, n,fill=0) %>%
+  mutate(frac_claim = `1`/(`1`+`0`)*100,
+         lwr = get_CI(`1`,(`1`+`0`))[[1]]*100,
+         upr = get_CI(`1`,(`1`+`0`))[[2]]*100
+         ) %>%
+  ggplot(aes(reorder(email, -frac_claim, FUN = max), frac_claim, fill = email)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5, size = 0.7, color = "gray30") +
+  theme(legend.position = "none") +
+  labs(x = "email", y = "repeated purchase [%]")
+
+p6 <- df_train_group %>%
+  group_by(age_group, flag) %>%
+  count() %>%
+  spread(flag, n,fill=0) %>%
+  mutate(frac_claim = `1`/(`1`+`0`)*100,
+         lwr = get_CI(`1`,(`1`+`0`))[[1]]*100,
+         upr = get_CI(`1`,(`1`+`0`))[[2]]*100
+         ) %>%
+  ggplot(aes(reorder(age_group, -frac_claim, FUN = max), frac_claim, fill = age_group)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5, size = 0.7, color = "gray30") +
+  theme(legend.position = "none") +
+  labs(x = "age_group", y = "repeated purchase [%]")
+
+layout <- matrix(c(1,2,3,4,5,6),3,2,byrow=TRUE)
+multiplot(p1, p2, p3, p4, p5, p6, layout=layout)
+```
+
+#### Interaction-Date features with target part 2 {-}
+
+```{r split=FALSE, fig.align = 'default', warning = FALSE, fig.cap ="Fig. 3", out.width="100%"}
+p1<-df_train%>%
+  group_by(week,flag)%>%
+  summarize(n=n_distinct(memberID))%>%
+  spread(flag,n,fill=0)%>%
+  mutate(frac_claim = `1`/(`1`+`0`)*100,
+         lwr = get_CI(`1`,(`1`+`0`))[[1]]*100,
+         upr = get_CI(`1`,(`1`+`0`))[[2]]*100
+         ) %>%
+  ggplot(aes(week, frac_claim, fill = week)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5, size = 0.7, color = "gray30") +
+  theme(legend.position = "none") +
+  labs(x = "week", y = "repeated purchase [%]")
+
+p2<-df_train%>%
+  group_by(month,flag)%>%
+  summarize(n=n_distinct(memberID))%>%
+  spread(flag,n,fill=0)%>%
+  mutate(frac_claim = `1`/(`1`+`0`)*100,
+         lwr = get_CI(`1`,(`1`+`0`))[[1]]*100,
+         upr = get_CI(`1`,(`1`+`0`))[[2]]*100
+         ) %>%
+  ggplot(aes(month, frac_claim, fill = month)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.5, size = 0.7, color = "gray30") +
+  theme(legend.position = "none") +
+  labs(x = "month", y = "repeated purchase [%]")
+
+layout <- matrix(c(1,2),2,1,byrow=TRUE)
+multiplot(p1, p2, layout=layout)
+```
+
+
+
+
+#### Interaction-Numeric features with target {-}
+```{r split=FALSE, fig.align = 'default', warning = FALSE, fig.cap ="Fig. 4", out.width="100%"}
+p1 <- df_train %>%
+  ggplot(aes(sales_amount, fill =flag)) +
+  geom_density(alpha = 0.5, bw = 0.05) +
+  scale_x_continuous(breaks=seq(0,3000,200))
+
+p2 <- df_train_group %>%
+  ggplot(aes(total_amount_531, fill =flag)) +
+  geom_density(alpha = 0.5, bw = 0.05) +
+  theme(legend.position = "none")+
+  scale_x_continuous(limits=c(1,4000),breaks=seq(0,4000,400))
+
+p3 <- df_train_group %>%
+  ggplot(aes(total_amount_2016, fill =flag)) +
+  geom_density(alpha = 0.5, bw = 0.05) +
+  theme(legend.position = "none")+
+  scale_x_continuous(limits=c(1,5000),breaks=seq(0,5000,500))
+
+layout <- matrix(c(1,2,3),3,1,byrow=TRUE)
+multiplot(p1, p2,p3, layout=layout)
+```
+
+
+### Multi-dimension relationship {.tabset}
+
+#### Correlation {-}
+
+Let's check if there is any feature having strong correlation. If there is, we may consider remove high correlated independent features and find features with high correlation with *flag*.     
+
+Conclusion:    
+1. *installment*,*sales_method*,*shipment_method*,*VIP* have strong correlation because they belong to same observation when the data is missing.    
+2. *sales_amount* and *flag* have weak positive correlation.     
+3. *sales_amount_531* and *flag* have positive correlation.   
+```{r}
+df_train[,!(colnames(df_train) %in% user_cl)]%>%
+  select(-productID,-Date_shipment,-Date_trans,-weekday)%>%
+  mutate_at(vars(SKU1,SKU2,SKU3,installment,sales_method,shipment_method,VIP,flag,month,week),funs(as.integer))%>%
+  cor(use="complete.obs", method = "spearman") %>%
+  corrplot(type="lower", tl.col = "black",  diag=FALSE)
+
+
+df_train_group%>%
+  select(-count,-memberID)%>%
+  mutate_at(vars(gender,age_group,city,email,flag),funs(as.integer))%>%
+  cor(use="complete.obs", method = "spearman") %>%
+  corrplot(type="lower", tl.col = "black",  diag=FALSE)
+
+```
+
+
+### conclusion {.tabset}
+We find these features as important variables to identify "flag". We can use these features to construct more features.     
+*SKU1*
+*sales_method*
+*shipment_method*(1 or other)
+*sales_amount*
+*sales_amount_531*
+*sales_amount_2016*
+
+
+
+## Feature construction {.tabset}
+
+### Customer-based product feature construction
+
+Because we find total_sales_amount is very important to predict repeated purchase. We combine user and product features and add aggregation of these feature to capture the characteristics. We also add recent activity as a signal of buy/not buy. The features we create are classified as:     
+1. count/ratio by month: ex:total purchase amount/count/unique product for each customer    
+2. aggregation: ex:sd,mean,sum of features in 1    
+3. Recent activity: ex:last month purchase amount/total amount ratio, last two month purchase ratio..
+
+```{r}
+# Create count/ratio features
+
+df1<-df%>%
+  group_by(memberID,month)%>%
+  summarize(purchase_item_count_month=sum(n()),
+            purchase_amount_month=sum(sales_amount),
+            purchase_u_product_month=sum(n_distinct(productID)),
+            purchase_u_SKU1_month=sum(n_distinct(SKU1)),
+            purchase_days=sum(n_distinct(Date_trans)))
+df1<-melt(df1,id.vars=1:2)
+df1<-dcast(df1,memberID~month+variable)
+df1[is.na(df1)]<-0
+
+#Aggregation variable
+df1<-df1%>%
+  mutate(sum_purchase_item_count=apply(df1[,grepl("purchase_item_count",names(df1)),],1,sum),
+         sum_purchase_amount=apply(df1[,grepl("purchase_amount",names(df1)),],1,sum),
+         sum_purchase_u_product=apply(df1[,grepl("purchase_u_product",names(df1)),],1,sum),
+         sum_purchase_u_SKU1=apply(df1[,grepl("purchase_u_SKU1",names(df1)),],1,sum),
+         sum_purchase_days=apply(df1[,grepl("purchase_days",names(df1)),],1,sum),
+         mean_purchase_item_count=apply(df1[,grepl("purchase_item_count",names(df1)),],1,mean),
+         mean_purchase_amount=apply(df1[,grepl("purchase_amount",names(df1)),],1,mean),
+         mean_purchase_u_product=apply(df1[,grepl("purchase_u_product",names(df1)),],1,mean),
+         mean_purchase_u_SKU1=apply(df1[,grepl("purchase_u_SKU1",names(df1)),],1,mean),
+         mean_purchase_days=apply(df1[,grepl("purchase_days",names(df1)),],1,mean),
+         sd_purchase_item_count=apply(df1[,grepl("purchase_item_count",names(df1)),],1,sd),
+         sd_purchase_amount=apply(df1[,grepl("purchase_amount",names(df1)),],1,sd),
+         sd_purchase_u_product=apply(df1[,grepl("purchase_u_product",names(df1)),],1,sd),
+         sd_purchase_u_SKU1=apply(df1[,grepl("purchase_u_SKU1",names(df1)),],1,sd),
+         sd_purchase_days=apply(df1[,grepl("purchase_days",names(df1)),],1,sd)
+         )
+#repeat purchase
+df1$repeat_purchase<-as.factor(ifelse(df1$sum_purchase_days>1,1,0))
+
+#Recent activity
+df1<-df1%>%
+  mutate(R1_month_purchase_item_ratio=round(`5_purchase_item_count_month`/sum_purchase_item_count,2),
+         R1_month_purchase_amount_ratio=round(`5_purchase_amount_month`/sum_purchase_amount,2),
+         R1_purchase_u_product_ratio=round(`5_purchase_u_product_month`/sum_purchase_u_product,2),
+         R1_purchase_u_SKU1_ratio=round(`5_purchase_u_SKU1_month`/sum_purchase_u_SKU1,2),
+         R1_purchase_days_ratio=round(`5_purchase_days`/sum_purchase_days,2),
+         R2_month_purchase_item_ratio=round((`5_purchase_item_count_month`+`4_purchase_item_count_month`)/sum_purchase_item_count,2),
+         R2_month_purchase_amount_ratio=round((`5_purchase_amount_month`+`4_purchase_amount_month`)/sum_purchase_amount,2),
+         R2_purchase_u_product_ratio=round((`5_purchase_u_product_month`+`4_purchase_u_product_month`)/sum_purchase_u_product,2),
+         R2_purchase_u_SKU1_ratio=round((`5_purchase_u_SKU1_month`+`4_purchase_u_SKU1_month`)/sum_purchase_u_SKU1,2),
+         R2_purchase_days_ratio=round((`5_purchase_days`+`4_purchase_days`)/sum_purchase_days,2))
+
+```
+
+Merge new features with original dataset and only include important features.
+```{r}
+#Using mode function to convert transaction-based feature to customer-based feature
+Mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+levels(df$shipment_method)<-c("1","0","0","0","0","0","0")
+
+df2<-df%>%
+  group_by(memberID,flag)%>%
+  summarize(sales_method=Mode(sales_method),shipment_method=Mode(shipment_method), Date_latest_purchase_531=max(Date_latest_purchase_531),total_amount_531=mean(total_amount_531))%>%
+  ungroup()%>%
+  mutate(last_purchase_days=as.numeric(difftime(as.Date("2016-06-01","%Y-%m-%d"),Date_latest_purchase_531,units="days")))%>%
+  mutate(last_purchase_weeks=round(last_purchase_days/7,0))%>%
+  select(-Date_latest_purchase_531)
+
+
+#Merge data together
+df_all<-merge(df1,df2,by="memberID")
+
+colnames(df_all)<-sub("^1_","Jan_",colnames(df_all))
+colnames(df_all)<-sub("^2_","Feb_",colnames(df_all))
+colnames(df_all)<-sub("^3_","Mar_",colnames(df_all))
+colnames(df_all)<-sub("^4_","Apr_",colnames(df_all))
+colnames(df_all)<-sub("^5_","May_",colnames(df_all))
+
+#df_all$repeat_purchase<-as.factor(df_all$repeat_purchase)
+```
+
+Arrange data and delete unuseful data 
+```{r warning=FALSE, message=FALSE}
+#Split original dataset
+df_train<-inner_join(df_all,df_train_customer,by="memberID")
+df_test<-inner_join(df_all,df_test_customer,by="memberID")
+
+#delete all the other dataset
+rm(list=setdiff(ls(), c("df_train","df_all","df_test","multiplot")))
+```
+
+
+# Classification Prediction {.tabset .tabset-fade .tabset-pills}
+
+## Benchmark Test
+
+First create different task:task with/without normalization.
+```{r}
+#Create task
+classif.task=makeClassifTask(id="classif.task",data=df_all[,-1],target="flag",positive = 1)
+
+#Create train and test task
+#training task without normalization/dummy features
+train_task<-makeClassifTask(id="classif.task",data=df_train[,-1],target="flag",positive = 1)
+train_task$task.desc$id<-"train_task"
+
+
+#training task with dummy features
+train_task_dummy<-createDummyFeatures(train_task)
+train_task_dummy$task.desc$id<-"train_task_dummy"
+
+
+#training task with normalization and dummy features
+train_task_normal<-normalizeFeatures(train_task)
+train_task_normal$task.desc$id<-"train_task_normal"
+train_task_normal<-createDummyFeatures(train_task_normal)
+
+
+#testing task without normalization/dummy features
+test_task<-makeClassifTask(id="classif.task",data=df_test[,-1],target="flag",positive = 1)
+test_task$task.desc$id<-"test_task"
+test_task<-createDummyFeatures(test_task)
+#testing task with dummy features
+test_task_dummy<-createDummyFeatures(test_task)
+test_task_dummy$task.desc$id<-"test_task_dummy"
+
+
+#testing task with normalization and dummy features
+test_task_normal<-normalizeFeatures(test_task)
+test_task_normal$task.desc$id<-"test_task_normal"
+test_task_normal<-createDummyFeatures(test_task_normal)
+
+#Because this dataset is imbalanced. So we use undersampling methods to eliminate the imbalance.
+#train.task.under=undersample(train_task,rate=1/8)
+#train.task.under.normal=undersample(train_task_normal,rate=1/8)
+#train.task.under$task.desc$id="train.task.under"
+#train.task.under.normal$task.desc$id="train.task.under.normal"
+```
+
+
+Try several basic models without feature selection and tunning.
+
+```{r split=FALSE, fig.align = 'default', warning = FALSE, fig.cap ="Fig. 1", out.width="100%"}
+## Create a list of learners
+lrns_list = listLearners(train_task_dummy, properties = "prob")
+tasks=list(train_task_dummy,train_task_normal)
+
+lrns = list(
+  makeLearner("classif.glmnet", id = "glmnet",predict.type = "prob"),
+  makeLearner("classif.logreg", id = "logreg",predict.type = "prob"),
+  makeLearner("classif.rpart", id = "rpart",predict.type = "prob"),
+  makeLearner("classif.randomForest", id = "randomForest",predict.type = "prob"),
+  makeLearner("classif.xgboost", id = "xgboost",predict.type = "prob"),
+  makeLearner("classif.gbm", id = "gbm",predict.type = "prob")
+)
+set.seed(1234)
+rdesc = makeResampleDesc("CV", iters = 5)
+meas = list(mmce, auc, acc,timetrain)
+bmr = benchmark(lrns, tasks, rdesc, meas, show.info = FALSE)
+bmr
+
+p1<-plotBMRBoxplots(bmr, measure = mmce)
+p2<-plotBMRBoxplots(bmr, measure = auc)
+p3<-plotBMRBoxplots(bmr, measure = acc)
+
+layout <- matrix(c(1,2,3),3,1,byrow=TRUE)
+multiplot(p1, p2, p3, layout=layout)
+
+
+mod_bmr=getBMRModels(bmr)
+pred_bmr=predict(mod_bmr$train_task_normal$gbm[[1]],task=test_task_normal)
+df = generateThreshVsPerfData(pred_bmr, measures = list(fpr, tpr, mmce))
+
+#AUC performance on testing normal data with gbm
+performance(pred_bmr, auc)
+
+p1<-plotROCCurves(df)
+p2<-plotThreshVsPerf(df)
+layout <- matrix(c(1,2),2,1,byrow=TRUE)
+multiplot(p1, p2, layout=layout)
+```
+
+## Tree-related models
+
+Becasue tree-related model doesn't need feature normalization and creating dummy variables, we compare decision tree and random forest on training dataset without processing and the one with processing. Although random forest has a good performance on training dataset without processing(AUC:0.65,ACC:0.90),its performance on testing dataset is worse.
+```{r split=FALSE, fig.align = 'default', warning = FALSE, fig.cap ="Fig. 1", out.width="100%"}
+# Create a list of learners
+
+tasks=list(train_task,train_task_normal)
+
+lrns = list(
+  makeLearner("classif.rpart", id = "rpart",predict.type = "prob"),
+  makeLearner("classif.randomForest", id = "randomForest",predict.type = "prob")
+)
+set.seed(1234)
+rdesc = makeResampleDesc("CV", iters = 5)
+meas = list(mmce, auc, acc,timetrain)
+bmr = benchmark(lrns, tasks, rdesc, meas, show.info = FALSE)
+bmr
+
+p1<-plotBMRBoxplots(bmr, measure = mmce)
+p2<-plotBMRBoxplots(bmr, measure = auc)
+p3<-plotBMRBoxplots(bmr, measure = acc)
+
+layout <- matrix(c(1,2,3),3,1,byrow=TRUE)
+multiplot(p1, p2, p3, layout=layout)
+
+
+mod_bmr=getBMRModels(bmr)
+pred_bmr=predict(mod_bmr$train_task_$randomForest[[1]],task=test_task)
+df = generateThreshVsPerfData(pred_bmr, measures = list(fpr, tpr, mmce))
+
+#AUC performance on testing normal data with gbm
+performance(pred_bmr, auc)
+
+p1<-plotROCCurves(df)
+p2<-plotThreshVsPerf(df)
+layout <- matrix(c(1,2),2,1,byrow=TRUE)
+multiplot(p1, p2, layout=layout)
+
+```
+
+
+## GBM
+```{r}
+#load GBM
+ getParamSet("classif.gbm")
+ g.gbm <- makeLearner("classif.gbm", predict.type = "prob")
+
+#specify tuning method
+ rancontrol <- makeTuneControlRandom(maxit = 50L)
+
+#3 fold cross validation
+ set_cv <- makeResampleDesc("CV",iters = 3L)
+
+#parameters
+gbm_par<- makeParamSet(
+makeDiscreteParam("distribution", values = "bernoulli"),
+makeIntegerParam("n.trees", lower = 100, upper = 200), #number of trees
+makeIntegerParam("interaction.depth", lower = 2, upper = 10), #depth of tree
+makeIntegerParam("n.minobsinnode", lower = 10, upper = 50)
+)
+#tune parameters
+meas = list(mmce, auc, acc,timetrain)
+tune_gbm <- tuneParams(learner = g.gbm, task = train_task_normal,resampling = set_cv,measures = meas,par.set = gbm_par,control = rancontrol)
+
+#check CV accuracy
+tune_gbm$y
+
+#set parameters
+final_gbm <- setHyperPars(learner = g.gbm, par.vals = tune_gbm$x)
+
+#train
+to.gbm <- mlr::train(final_gbm, train_task_normal)
+
+#test 
+pr.gbm <- predict(to.gbm, test_task_normal)
+#tesr performance
+df = generateThreshVsPerfData(pr.gbm,measures = list(fpr, tpr, mmce))
+
+#AUC performance on testing normal data with gbm     
+performance(pr.gbm, list(auc,acc))
+
+p1<-plotROCCurves(df)
+p2<-plotThreshVsPerf(df)
+layout <- matrix(c(1,2),2,1,byrow=TRUE)
+multiplot(p1, p2, layout=layout)
+
+```
+
+
+We want to compare different method of feature selection and get the idea of feature importance. Then we select limited number of features to train new model and compare the performance.
+```{r}
+#selecting top 30 important features based on random forest importance 
+fv = generateFilterValuesData(train_task, method = "rf.importance", abs = 20)
+plotFilterValues(fv)
+
+#Top 5:sum_purchase_amount,mean_purchase_amount,sd_purchase_amount,April_purchase_amount_month,last_purchase_days
+
+
+# Compare with the feature importance based on gbm model
+FI_gbm<-getFeatureImportance(to.gbm)
+#Top 5:total_amount_531,sum_purchase_amount,last_purchase_days,sd_purchase_amount,May_purchase_amount_month
+```
+
+Training gbm model with top 20 features. The performance(AUC:0.69,ACC:0.90) on training dataset is the same with gbm with all features. The performance on testing data is almost the same(AUC:0.66,ACC:0.89).Considering overfitting, we decide to choose the model with 20 features.
+```{r}
+
+top_task <- filterFeatures(train_task_normal, method = "rf.importance", abs = 20)
+
+set.seed(1234)
+
+tune_gbm_top <- tuneParams(learner = g.gbm, task = top_task,resampling = set_cv,measures = meas,par.set = gbm_par,control = rancontrol)
+
+#check CV performance
+tune_gbm_top$y
+
+#set parameters
+final_gbm_top <- setHyperPars(learner = g.gbm, par.vals = tune_gbm_top$x)
+
+#train
+to.gbm_top <- mlr::train(final_gbm_top, top_task)
+
+#test 
+gbm_top_task = subsetTask(test_task_normal, features = to.gbm_top$features)
+pr.gbm.top <- predict(to.gbm_top, gbm_top_task)
+#test performance
+df.top = generateThreshVsPerfData(pr.gbm.top,measures = list(fpr, tpr, mmce))
+
+#AUC performance on testing normal data with gbm     
+performance(pr.gbm.top, list(mmce,auc,acc))
+
+p1<-plotROCCurves(df.top)
+p2<-plotThreshVsPerf(df.top)
+layout <- matrix(c(1,2),2,1,byrow=TRUE)
+multiplot(p1, p2, layout=layout)
+
+```
+
+## Model decision
+
+```{r}
+#Model description
+to.gbm_top$learner.model
+```
+
+```{r}
+#Feature selected
+to.gbm_top$features
+
+#Feature importance
+getFeatureImportance(to.gbm_top)
+```
+
+```{r}
+#Performance on training and testing data
+
+#performance on training 
+tune_gbm_top$y
+#performance on testing
+performance(pr.gbm.top, list(mmce,auc,acc))
+#Plot
+multiplot(p1, p2, layout=layout)
+```
+
+
+
+
+
+
+#Go back to feature importance {.tabset .tabset-fade .tabset-pills}
+
+Let's plot the top important feature relationship with *flag*
+Top 5:total_amount_531,sum_purchase_amount,last_purchase_days,sd_purchase_amount,May_purchase_amount_month
+
+
+## Interaction-Numeric features with target
+
+Here we have some very important and interesting findings.    
+
+1. total_amount_531: It's the accumlated purchase amount to 2016.05.31(not starts from 2016). Customer with higher accumlated purchase amount has the higher chance to purchase again in next 2 months.    
+2. sum_purchase_amount: It's the total purchase amount between 2016.01.01-2016.05.31. There are two trends.Customer with highest and lowest total purchase amount in 2016 has the higher chance to purchase again in next 2 months.    
+3. last_purchase_days: It's the day between customer last purchase date and 2016.05.31. We could see there're two very strong indicators. Customers who haven't purchase for 48 days (7 weeks) or 83 days (12 weeks) are most likely to purchase in the next 2 months.    
+4. sd_purchase_amount:It's the standard deviation of total purchase amount in each month of 2016 for each customer. Customers whose purchase amount with lower variance have higher repeated purchase chance.    
+5. May_purchase_amount_month: It's the total purchase amount in May. We could see clear that customers with lowest purchase amount in May have higher chance to purchase in next 2 months.
+
+To summary, the importance features of repeated purchase are all about time and purchase amount. Customers who bought a lot and who didn't buy anything in 7/12 weeks have the high probability to buy in the next two months!
+
+
+```{r split=FALSE, fig.align = 'default', warning = FALSE, fig.cap ="Fig. 4", out.width="100%"}
+p1 <- df_train%>%
+  ggplot(aes(total_amount_531, fill =flag)) +
+  geom_density(alpha = 0.5, bw = 0.05) +
+  theme(legend.position = "none",axis.text.x=element_text(angle=60,hjust=1,vjust=0.5))+
+  scale_x_continuous(limits=c(1,10000),breaks=seq(0,10000,2000))
+
+
+p2 <- df_train %>%
+  ggplot(aes(sum_purchase_amount, fill =flag)) +
+  geom_density(alpha = 0.5, bw = 0.05)+
+  theme(legend.position = "none",axis.text.x=element_text(angle=60,hjust=1,vjust=0.5))+
+  scale_x_continuous(limits=c(1,5000),breaks=seq(0,5000,500))
+
+p3 <- df_train %>%
+  ggplot(aes(last_purchase_days, fill =flag)) +
+  geom_density(alpha = 0.5, bw = 0.05)+
+  scale_x_continuous(limits=c(0,150),breaks=seq(0,150,15))
+
+p4 <- df_train %>%
+  ggplot(aes(sd_purchase_amount, fill =flag)) +
+  geom_density(alpha = 0.5, bw = 0.05)+
+  theme(legend.position = "none")+
+  scale_x_continuous(limits=c(1,1000),breaks=seq(0,1000,100))
+
+p5 <- df_train %>%
+  ggplot(aes(May_purchase_amount_month, fill =flag)) +
+  geom_density(alpha = 0.5, bw = 0.05)+
+  theme(legend.position = "none")+
+  scale_x_continuous(limits=c(0,200),breaks=seq(0,200,10))
+
+
+layout <- matrix(c(1,2,3,4,5,5),3,2,byrow=TRUE)
+ multiplot(p1, p2,p4,p5,p3, layout=layout)
+```
+
